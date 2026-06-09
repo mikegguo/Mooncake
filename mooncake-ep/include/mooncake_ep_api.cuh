@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cuda_runtime.h>
+#include <mooncake_ep_device.h>
 
 namespace mooncake {
 

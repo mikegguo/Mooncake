@@ -126,6 +126,21 @@ __device__ __forceinline__ void mc_grid_sync() {
 }
 
 // ---------------------------------------------------------------------------
+// System-level memory fence — no-op on CUDA (hardware guarantees P2P
+// visibility through NVLink without explicit fences).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void mc_fence() {}
+
+// ---------------------------------------------------------------------------
+// Fence → barrier → fence: ensures all threads' writes are globally visible
+// before any thread proceeds.  On CUDA, __syncthreads() implies a memory
+// fence, so a single __syncthreads() is sufficient.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void mc_fence_barrier_fence() {
+    __syncthreads();
+}
+
+// ---------------------------------------------------------------------------
 // Byte-swap helpers (for mlx5 big-endian WQE fields)
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ uint16_t mc_bswap16(uint16_t x) {

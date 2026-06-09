@@ -1,10 +1,7 @@
 #ifndef MOONCAKE_EP_BUFFER_H
 #define MOONCAKE_EP_BUFFER_H
 
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <mooncake_ep_device.h>
 #include <memory>
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
@@ -75,7 +72,7 @@ struct MooncakeEpBuffer {
     void* gdr_buffer = nullptr;
 
     // Device transports — own all platform-specific state.
-    // p2p_transport_: NVLink intra-node P2P.
+    // p2p_transport_: NVLink (CUDA) or MTLink (MUSA) intra-node P2P.
     // rdma_transport_: IBGDA inter-node RDMA.  nullptr when IBGDA unavailable.
     device::P2pTransport* p2p_transport_ = nullptr;
     device::RdmaTransport* rdma_transport_ = nullptr;
@@ -90,7 +87,7 @@ struct MooncakeEpBuffer {
     int USE_QP_COUNT = MAX_QP_COUNT;
 
     // Stream for communication
-    at::cuda::CUDAStream comm_stream;
+    DeviceStream comm_stream;
 
     // Workspace
     void* workspace = nullptr;
@@ -146,13 +143,14 @@ struct MooncakeEpBuffer {
 
     // Connect IBGDA QPs to peers.  Unified entry point — handles both IB and
     // RoCE based on is_roce().
-    void sync_ibgda_peers(const std::vector<int64_t>& remote_addrs,
-                          const std::vector<int32_t>& remote_keys,
-                          const std::vector<std::vector<int32_t>>& peer_qpns,
-                          const std::vector<std::vector<int32_t>>& peer_lids,
-                          const std::vector<int64_t>& subnet_prefixes,
-                          const std::vector<int64_t>& interface_ids,
-                          const std::vector<int>& active_ranks_mask);
+    void sync_ibgda_peers(
+        const std::vector<int64_t>& remote_addrs,
+        const std::vector<int32_t>& remote_keys,
+        const std::vector<std::vector<int32_t>>& peer_qpns,
+        const std::vector<std::vector<int32_t>>& peer_lids,
+        const std::vector<int64_t>& subnet_prefixes,
+        const std::vector<int64_t>& interface_ids,
+        const std::vector<int>& active_ranks_mask);
 
     // Metadata accessors for Python-level bootstrap exchange.
     std::tuple<int64_t, int32_t> get_mr_info() {
@@ -177,12 +175,17 @@ struct MooncakeEpBuffer {
         return rdma_transport_->localMetadata().lids;
     }
 
-    // IPC handle for P2P (NVLink).
+    // IPC handle for P2P (NVLink / MTLink).
     std::vector<int32_t> get_ipc_handle();
 
     void sync_nvlink_ipc_handles(
         const std::vector<std::vector<int32_t>>& remote_handles,
         const std::vector<int>& active_ranks_mask);
+
+    // Verify P2P peer access works (host-side memcpy test).
+    bool verify_peer_access() {
+        return p2p_transport_ && p2p_transport_->verifyPeerAccess();
+    }
 };
 
 inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,

@@ -21,15 +21,10 @@ class EPException : public std::exception {
     const char* what() const noexcept override { return message.c_str(); }
 };
 
+// EP_CHECK is defined in mooncake_ep_device.h (unified CUDA/MUSA).
+// CUDA_CHECK is kept as an alias for backward compatibility.
 #ifndef CUDA_CHECK
-#define CUDA_CHECK(cmd)                                   \
-    do {                                                  \
-        cudaError_t e = (cmd);                            \
-        if (e != cudaSuccess) {                           \
-            throw EPException("CUDA", __FILE__, __LINE__, \
-                              cudaGetErrorString(e));     \
-        }                                                 \
-    } while (0)
+#define CUDA_CHECK(cmd) EP_CHECK(cmd)
 #endif
 
 #ifndef EP_HOST_ASSERT

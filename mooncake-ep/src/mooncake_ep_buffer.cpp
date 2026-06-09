@@ -23,18 +23,19 @@ static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
     return ret == 0;
 }
 
-MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
-                                   int64_t num_ep_buffer_bytes,
-                                   TransferEngine* engine)
+MooncakeEpBuffer::MooncakeEpBuffer(
+    int rank, int num_ranks, int64_t num_ep_buffer_bytes,
+    TransferEngine* engine)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
-      comm_stream(at::cuda::getStreamFromPool(true)) {
+      comm_stream(EP_GET_STREAM_FROM_POOL(true))
+{
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
-    // Get ranks
+
     CUDA_CHECK(cudaGetDevice(&device_id));
-    CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
-                                      device_id));
+    CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz,
+                                      cudaDevAttrClockRate, device_id));
 
     // P2P transport — owns GDR buffer allocation and IPC handle exchange.
     if (engine) {
@@ -55,8 +56,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         rdma_transport_ = engine->getOrCreateRdmaTransport();
         if (rdma_transport_) {
             if (!initRdmaTransport(rdma_transport_, gdr_buffer,
-                                   num_ep_buffer_bytes, num_ranks, USE_QP_COUNT,
-                                   comm_stream.stream())) {
+                                   num_ep_buffer_bytes, num_ranks,
+                                   USE_QP_COUNT, comm_stream.stream())) {
                 rdma_transport_ = nullptr;
                 ibgda_disabled_ = true;
                 LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
@@ -65,8 +66,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
             ibgda_disabled_ = true;
         }
     } else {
-        // Read optional NIC whitelist from env var (same convention as PG
-        // tests).
+        // Read optional NIC whitelist from env var (same convention as PG tests).
         std::vector<std::string> device_filter;
         if (const char* env = std::getenv("MOONCAKE_EP_DEVICE_FILTER")) {
             std::string s(env);
@@ -78,7 +78,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         }
         auto t = device::createIbgdaDeviceTransport(device_filter);
         if (initRdmaTransport(t.get(), gdr_buffer, num_ep_buffer_bytes,
-                              num_ranks, USE_QP_COUNT, comm_stream.stream())) {
+                              num_ranks, USE_QP_COUNT,
+                              comm_stream.stream())) {
             owned_rdma_transport_ = std::move(t);
             rdma_transport_ = owned_rdma_transport_.get();
         } else {
@@ -87,14 +88,15 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         }
     }
 
-    // Create 32 MiB workspace
+    // Workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
-    CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+    CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES,
+                               comm_stream.stream()));
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
-    // When EP owns the rdma transport, destructor handles QP/MR/ctrl_buf
-    // teardown. When engine owns it, just clear the pointer.
+    // When EP owns the rdma transport, destructor handles QP/MR/ctrl_buf teardown.
+    // When engine owns it, just clear the pointer.
     owned_rdma_transport_.reset();
     rdma_transport_ = nullptr;
 
@@ -153,7 +155,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = EP_GET_CURRENT_STREAM();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
@@ -176,9 +178,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     auto packed_recv_x_scales = std::optional<torch::Tensor>();
     float* packed_recv_x_scales_ptr = nullptr;
     if (use_fp8) {
-        EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 ==
-                           0 and
-                       "TMA requires the number of tokens to be multiple of 4");
+        EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0);
         packed_recv_x_scales =
             torch::empty({num_local_experts, num_scales,
                           num_ranks * num_max_dispatch_tokens_per_rank},
@@ -211,7 +211,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x.data_ptr(),
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
-            num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
+            num_experts, rank, num_ranks, use_fp8, workspace, launch_stream.stream(),
             timeout_ticks, phases);
     };
     launcher(return_recv_hook
@@ -275,6 +275,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     EP_HOST_ASSERT(layout_range.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(layout_range.size(0) == num_experts / num_ranks and
                    layout_range.size(1) == num_ranks);
+
     auto hidden = static_cast<int>(x.size(2));
     auto num_local_experts = num_experts / num_ranks,
          num_topk = static_cast<int>(topk_weights.size(1));
@@ -289,7 +290,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = EP_GET_CURRENT_STREAM();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
@@ -329,7 +330,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             layout_range.data_ptr<int64_t>(),
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, workspace, launch_stream, timeout_ticks, phases,
+            num_ranks, workspace, launch_stream.stream(), timeout_ticks, phases,
             zero_copy);
     };
     launcher(return_recv_hook
@@ -360,21 +361,21 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
     int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
-
     auto buffer = layout.buffers[buffer_idx];
-    auto dtype = torch::kBFloat16;
     size_t num_bytes_per_combine_msg = hidden * sizeof(nv_bfloat16);
-    auto num_msg_elems =
-        static_cast<int>(num_bytes_per_combine_msg / elementSize(dtype));
-
-    EP_HOST_ASSERT(num_bytes_per_combine_msg % elementSize(dtype) == 0);
+    auto num_msg_elems = static_cast<int>(num_bytes_per_combine_msg /
+                                          elementSize(torch::kBFloat16));
+    EP_HOST_ASSERT(num_bytes_per_combine_msg % elementSize(torch::kBFloat16) ==
+                   0);
     return torch::from_blob(
         buffer.rdma_send_data_buffer,
         {num_experts / num_ranks, num_ranks * num_max_dispatch_tokens_per_rank,
          hidden},
         {num_ranks * num_max_dispatch_tokens_per_rank * num_msg_elems,
          num_msg_elems, 1},
-        torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
+        torch::TensorOptions()
+            .dtype(torch::kBFloat16)
+            .device(torch::Device(kDeviceType, device_id)));
 }
 
 void MooncakeEpBuffer::update_local_qpns() {
@@ -414,8 +415,7 @@ void MooncakeEpBuffer::sync_ibgda_peers(
         flat_lids, subnet_prefixes, interface_ids, active_ranks_mask);
     if (ret != 0) {
         ibgda_disabled_ = true;
-        LOG(WARNING)
-            << "[EP] IBGDA connectPeers failed, falling back to P2P-only path";
+        LOG(WARNING) << "[EP] IBGDA connectPeers failed, falling back to P2P-only path";
     }
 }
 

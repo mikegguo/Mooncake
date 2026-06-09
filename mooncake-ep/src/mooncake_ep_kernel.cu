@@ -5,7 +5,7 @@
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_exception.cuh>
 #include <mooncake_ep_launch.cuh>
-#include <transport/device/comm_device.cuh>
+#include "transport/device/comm_device.cuh"
 #include <mooncake_ep_utils.cuh>
 
 namespace mooncake {
@@ -27,7 +27,11 @@ using mooncake::device::mc_st_release;
 using mooncake::device::mc_atomic_add_release;
 
 template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
-__global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
+#ifdef MOONCAKE_EP_USE_MUSA
+__global__ void
+#else
+__global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
+#endif
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count, int32_t* active_ranks,
@@ -140,7 +144,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                         rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&int4_value);
                     }
                 }
+#ifdef MOONCAKE_EP_USE_MUSA
+            // MUSA has no named barriers.  Use __syncthreads() for
+            // cross-warp synchronization.  Warp 31 participates via
+            // a matching loop below so all 32 warps reach the barrier.
+            __syncthreads();
+#else
             mc_bar_sync(1, num_threads);
+#endif
 
             // Issue sends
             if (dst_expert_idx >= 0) {
@@ -160,7 +171,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     // Local or P2P path — warp-cooperative copy
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
+                    // Fence immediately before P2P stores to ensure they
+                    // are issued after all prior operations complete.
+                    // Matches the mc_st_release pattern (fence→store).
+                    EP_DEVICE_FENCE();
                     UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, mc_ld_nc, mc_st_na);
+                    // All threads wrote to peer memory; all must fence
+                    EP_DEVICE_FENCE();
                 } else {
                     // IBGDA path — send directly from source buffer
                     mc_rdma_put(comm_ctx, dst_expert_local_idx % num_qp_per_rank, dst_rank, num_qp_per_rank,
@@ -173,6 +190,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             }
         }
     } else if (warp_id == num_warps - 1) {
+#ifdef MOONCAKE_EP_USE_MUSA
+        // Participate in __syncthreads() barriers from warps 0-30.
+        // Each token iteration in the send loop above calls
+        // __syncthreads() once; warp 31 must match.
+        for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
+            __syncthreads();
+        }
+#endif
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
             // The first SM is also responsible for cleaning the next buffer
@@ -210,7 +235,17 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             }
         }
     }
+#ifdef MOONCAKE_EP_USE_MUSA
+    // Ensure data-send warps' writes (P2P data + atomic counters) are
+    // visible system-wide before the count-send sub-warps proceed.
+    // MUSA __syncthreads() may not imply a memory fence, so we use the
+    // same fence→barrier→fence pattern as the RECV phase.
+    EP_DEVICE_FENCE();
     __syncthreads();
+    EP_DEVICE_FENCE();
+#else
+    __syncthreads();
+#endif
 
     // Issue count sends
     if (responsible_expert_idx < num_experts and sub_warp_id == 0 and lane_id == 0) {
@@ -248,24 +283,28 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         mc_grid_sync();
 
     // Receiving and packing
+    __shared__ int shared_num_recv_tokens[kNumWarpGroups], shared_recv_token_begin_idx[kNumWarpGroups];
+    int num_recv_tokens = 0, recv_token_begin_idx = 0;
+    // Declare locals outside the if block so they're visible after the barrier
+    uint8_t* rdma_recv_x_uint8 = nullptr;
+    int4* recv_x_int4 = nullptr;
+    float* recv_x_scales = nullptr;
+    int* recv_src_info = nullptr;
+    int64_t* recv_range = nullptr;
     if (responsible_expert_idx < num_experts) {
         const auto src_rank = responsible_expert_idx / num_local_experts;
         const auto local_expert_idx = responsible_expert_idx % num_local_experts;
-        const auto rdma_recv_x_uint8 = reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) +
+        rdma_recv_x_uint8 = reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                 src_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
-        const auto recv_x_int4 = reinterpret_cast<int4*>(packed_recv_x) +
+        recv_x_int4 = reinterpret_cast<int4*>(packed_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_int4;
-        const auto recv_x_scales = packed_recv_x_scales + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_scales;
-        const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
-        const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
-
-        // Shared between sub-warps in warp groups
-        __shared__ int shared_num_recv_tokens[kNumWarpGroups], shared_recv_token_begin_idx[kNumWarpGroups];
+        recv_x_scales = packed_recv_x_scales + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_scales;
+        recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
+        recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
 
         // Wait tokens to arrive
         // NOTES: using sub-warp 1 to overlap with sub-warp 0
-        int num_recv_tokens, recv_token_begin_idx;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         if (sub_warp_id == 1 and lane_id == 0) {
             unsigned long long start_time = clock64();
@@ -285,12 +324,24 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
         }
+    }
+#ifdef MOONCAKE_EP_USE_MUSA
+    // Ensure peer writes are visible before reading: fence, barrier, fence
+    EP_DEVICE_FENCE();
+    __syncthreads();
+    EP_DEVICE_FENCE();
+#else
+    if (responsible_expert_idx < num_experts)
         mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
+#endif
+    if (responsible_expert_idx < num_experts) {
         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
 
         // Copy tokens
         EP_DEVICE_ASSERT(num_scales <= 64);
+        // Ensure peer memory writes from other GPUs are visible before reading.
+        EP_DEVICE_FENCE();
         for (int i = sub_warp_id; i < num_recv_tokens; i += kNumWarpsPerGroup) {
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
@@ -302,6 +353,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             // NOTES: only 2 load iterations for 7K hidden with 7 unrolls
             const auto src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4));
             const auto dst_data = recv_x_int4 + (recv_token_begin_idx + i) * hidden_int4;
+            // Ensure peer writes are visible before each token copy
+            EP_DEVICE_FENCE();
             UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, mc_ld_nc, mc_st_na);
 
             // Copy scales
@@ -346,6 +399,59 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
 
+#ifdef MOONCAKE_EP_USE_MUSA
+    EP_HOST_ASSERT(!use_fp8 && "MUSA does not support FP8");
+#endif
+
+#ifdef MOONCAKE_EP_USE_MUSA
+// Multi-block: split send/recv phases with device sync between them.
+// This tests whether MUSA IPC supports concurrent multi-block writes
+// to peer memory (with proper fences).
+#define DISPATCH_LAUNCH_CASE(hidden) { \
+auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup, hidden> : \
+                               dispatch<false, kNumWarpGroups, kNumWarpsPerGroup, hidden>; \
+if (phases & LOW_LATENCY_SEND_PHASE) { \
+LAUNCH_KERNEL(&cfg, dispatch_func, \
+              packed_recv_x, packed_recv_x_scales, \
+              packed_recv_src_info, packed_recv_layout_range, \
+              packed_recv_count, active_ranks, \
+              mxa_buffer, \
+              rdma_send_signal_buffer, rdma_recv_signal_buffer, \
+              rdma_send_data_buffer, rdma_recv_data_buffer, \
+              cuda_counter_buffer, cuda_data_buffer, \
+              raddrs, rkeys, qp_devctxs, \
+              nvlink_available, ipc_peer_ptrs, \
+              x, topk_idx, \
+              atomic_counter_per_expert, atomic_finish_counter_per_expert, \
+              next_clean_buffer, \
+              num_tokens, num_max_dispatch_tokens_per_rank, \
+              num_topk, num_experts, rank, num_ranks, timeout_ticks, \
+              LOW_LATENCY_SEND_PHASE); \
+EP_DEVICE_SYNCHRONIZE(); \
+} \
+if (phases & LOW_LATENCY_RECV_PHASE) { \
+LAUNCH_KERNEL(&cfg, dispatch_func, \
+              packed_recv_x, packed_recv_x_scales, \
+              packed_recv_src_info, packed_recv_layout_range, \
+              packed_recv_count, active_ranks, \
+              mxa_buffer, \
+              rdma_send_signal_buffer, rdma_recv_signal_buffer, \
+              rdma_send_data_buffer, rdma_recv_data_buffer, \
+              cuda_counter_buffer, cuda_data_buffer, \
+              raddrs, rkeys, qp_devctxs, \
+              nvlink_available, ipc_peer_ptrs, \
+              x, topk_idx, \
+              atomic_counter_per_expert, atomic_finish_counter_per_expert, \
+              next_clean_buffer, \
+              num_tokens, num_max_dispatch_tokens_per_rank, \
+              num_topk, num_experts, rank, num_ranks, timeout_ticks, \
+              LOW_LATENCY_RECV_PHASE); \
+EP_DEVICE_SYNCHRONIZE(); \
+} \
+} break
+
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+#else
 #define DISPATCH_LAUNCH_CASE(hidden) { \
 auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup, hidden> : \
                                dispatch<false, kNumWarpGroups, kNumWarpsPerGroup, hidden>; \
@@ -366,12 +472,17 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               num_topk, num_experts, rank, num_ranks, timeout_ticks, phases); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+#endif
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
 
 template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
-__global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
+#ifdef MOONCAKE_EP_USE_MUSA
+__global__ void
+#else
+__global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
+#endif
 combine(void* combined_x, int32_t* active_ranks,
         void* mxa_buffer,
         int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
@@ -415,6 +526,8 @@ combine(void* combined_x, int32_t* active_ranks,
     const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
+    // Declare locals before the goto to avoid jump-over-initialization errors
+    int dst_rank = 0, local_expert_idx = 0, global_expert_idx = 0;
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_COMBINE_RECV;
 
@@ -432,9 +545,9 @@ combine(void* combined_x, int32_t* active_ranks,
 
     // Issue IBGDA sends
     if (responsible_expert_idx < num_experts) {
-        const auto dst_rank = responsible_expert_idx / num_local_experts;
-        const auto local_expert_idx = responsible_expert_idx % num_local_experts;
-        const auto global_expert_idx = rank * num_local_experts + local_expert_idx;
+        dst_rank = responsible_expert_idx / num_local_experts;
+        local_expert_idx = responsible_expert_idx % num_local_experts;
+        global_expert_idx = rank * num_local_experts + local_expert_idx;
         const auto layout = __ldg(layout_range + local_expert_idx * num_ranks + dst_rank);
         const auto local_x = reinterpret_cast<const int4*>(x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_bf16_int4;
@@ -464,6 +577,8 @@ combine(void* combined_x, int32_t* active_ranks,
                 // Local or P2P path — warp-cooperative copy
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
+                // All threads wrote to peer memory; all must fence
+                EP_DEVICE_FENCE();
             } else {
                 // IBGDA path — stage to send buffer then RDMA write
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
@@ -474,10 +589,22 @@ combine(void* combined_x, int32_t* active_ranks,
                                   buf_ptr, dst_ptr, num_bytes_per_slot, lane_id);
             }
         }
+    }
 
-        // Put finishing flag
+    // Put finishing flag
+    // On MUSA, __syncthreads() must be called by all threads in the block,
+    // so we move it outside the if (responsible_expert_idx < num_experts) guard.
+    // Also, EP_DEVICE_FENCE() must be called by ALL threads that did
+    // writes (not just the signaling thread) to make P2P stores visible.
+#ifdef MOONCAKE_EP_USE_MUSA
+    EP_DEVICE_FENCE();
+    __syncthreads();
+#endif
+    if (responsible_expert_idx < num_experts) {
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
+#ifndef MOONCAKE_EP_USE_MUSA
         mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
+#endif
         if (sub_warp_id == 1 and lane_id == 0) {
             while (mc_ld_acquire(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
@@ -513,13 +640,24 @@ combine(void* combined_x, int32_t* active_ranks,
             }
         }
     }
+#ifdef MOONCAKE_EP_USE_MUSA
+    // mc_grid_sync() is a no-op on MUSA; use double __syncthreads()
+    // with EP_DEVICE_FENCE() to ensure all threads see peer writes
+    // before any thread starts reduction.
+    __syncthreads();
+    EP_DEVICE_FENCE();
+    __syncthreads();
+#else
     mc_grid_sync();
+#endif
 
     // Reduce tokens with FP8 cast
     EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
     if (thread_id < hidden_bf16_int4) {
         for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
+            // Ensure peer memory writes from other GPUs are visible before each token
+            EP_DEVICE_FENCE();
             // Read top-k indices and weights
             int reg_topk_idx[kNumMaxTopk];
             float reg_topk_weights[kNumMaxTopk];
@@ -581,6 +719,50 @@ void combine(void* combined_x, int32_t* active_ranks,
     EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
     EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
 
+#ifdef MOONCAKE_EP_USE_MUSA
+// Multi-block: split send/recv phases with device sync between them.
+#define COMBINE_LAUNCH_CASE(hidden) { \
+auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
+if (phases & LOW_LATENCY_SEND_PHASE) { \
+LAUNCH_KERNEL(&cfg, combine_func, \
+              combined_x, active_ranks, \
+              mxa_buffer, \
+              rdma_send_signal_buffer, rdma_recv_signal_buffer, \
+              rdma_send_data_buffer, rdma_recv_data_buffer, \
+              cuda_counter_buffer, cuda_data_buffer, \
+              raddrs, rkeys, qp_devctxs, \
+              nvlink_available, ipc_peer_ptrs, \
+              x, topk_idx, topk_weights, src_info, layout_range, \
+              next_clean_buffer, \
+              atomic_clean_flag, \
+              num_combined_tokens, hidden, num_topk, \
+              num_max_dispatch_tokens_per_rank, \
+              num_experts, rank, num_ranks, \
+              timeout_ticks, LOW_LATENCY_SEND_PHASE, zero_copy); \
+EP_DEVICE_SYNCHRONIZE(); \
+} \
+if (phases & LOW_LATENCY_RECV_PHASE) { \
+LAUNCH_KERNEL(&cfg, combine_func, \
+              combined_x, active_ranks, \
+              mxa_buffer, \
+              rdma_send_signal_buffer, rdma_recv_signal_buffer, \
+              rdma_send_data_buffer, rdma_recv_data_buffer, \
+              cuda_counter_buffer, cuda_data_buffer, \
+              raddrs, rkeys, qp_devctxs, \
+              nvlink_available, ipc_peer_ptrs, \
+              x, topk_idx, topk_weights, src_info, layout_range, \
+              next_clean_buffer, \
+              atomic_clean_flag, \
+              num_combined_tokens, hidden, num_topk, \
+              num_max_dispatch_tokens_per_rank, \
+              num_experts, rank, num_ranks, \
+              timeout_ticks, LOW_LATENCY_RECV_PHASE, zero_copy); \
+EP_DEVICE_SYNCHRONIZE(); \
+} \
+} break
+
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+#else
 #define COMBINE_LAUNCH_CASE(hidden) { \
 auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
 LAUNCH_KERNEL(&cfg, combine_func, \
@@ -600,6 +782,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               timeout_ticks, phases, zero_copy); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+#endif
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }

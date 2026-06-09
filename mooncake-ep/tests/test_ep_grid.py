@@ -12,6 +12,19 @@ import traceback
 from mooncake.mooncake_ep_buffer import Buffer
 import mooncake.pg as pg
 
+_USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
+if _USE_MUSA:
+    import torch_musa
+    _sync = torch_musa.synchronize
+    _set_device = torch_musa.set_device
+    _device_count = torch_musa.device_count
+    _DEVICE = "musa"
+else:
+    _sync = torch.cuda.synchronize
+    _set_device = torch.cuda.set_device
+    _device_count = torch.cuda.device_count
+    _DEVICE = "cuda"
+
 
 def dequantize_fp8(x_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     hidden = x_fp8.shape[-1]
@@ -45,13 +58,13 @@ def run_test_iteration(
     num_tokens = int(max_tokens * scale)
 
     # Prepare test data
-    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32)
+    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device=_DEVICE)
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device=_DEVICE)
     topk_idx = torch.topk(scores, top_k, dim=-1)[1]
     topk_weights = torch.softmax(
-        torch.rand(num_tokens, top_k, dtype=torch.float32), dim=-1
+        torch.rand(num_tokens, top_k, dtype=torch.float32, device=_DEVICE), dim=-1
     )
-    active_ranks = torch.ones((num_ranks,), dtype=torch.int32)
+    active_ranks = torch.ones((num_ranks,), dtype=torch.int32, device=_DEVICE)
 
     # Prepare expected result
     def get_mock_factor(expert_id):
@@ -84,6 +97,11 @@ def run_test_iteration(
     )
     buf = Buffer(group, num_ep_buffer_bytes)
 
+    # Avoid changing torch_musa's process-wide default device; all tensors in
+    # this test already pass device explicitly.
+    if not _USE_MUSA:
+        torch.set_default_device(_DEVICE)
+
     if use_fallback:
         buf._use_fallback = True
 
@@ -93,6 +111,11 @@ def run_test_iteration(
     dist.barrier(group)
 
     if rank == fail_rank:
+        import time
+        # Don't exit immediately — mp.spawn would SIGTERM survivors before
+        # they finish dispatch+combine.  Sleep long enough for survivors
+        # (dispatch 5s timeout + combine 5s timeout + overhead).
+        time.sleep(30)
         os._exit(0)
 
     # Dispatch
@@ -108,12 +131,12 @@ def run_test_iteration(
         return_recv_hook=return_recv_hook,
     )
 
-    if return_recv_hook:
+    if return_recv_hook or hook is not None:
         hook()
     if async_finish:
         event.current_stream_wait()
 
-    torch.cuda.synchronize()
+    _sync()
     # Fault-tolerance check
     if fail_rank != -1:
         assert active_ranks[fail_rank].item() == 0, (
@@ -164,12 +187,12 @@ def run_test_iteration(
         out=out_tensor,
     )
 
-    if return_recv_hook:
+    if return_recv_hook or hook is not None:
         hook()
     if async_finish:
         event.current_stream_wait()
 
-    torch.cuda.synchronize()
+    _sync()
 
     testing.assert_close(
         combined_x,
@@ -179,25 +202,28 @@ def run_test_iteration(
         msg=lambda msg: f"[Rank {rank}] Combine Mismatch. {msg}",
     )
 
-    torch.cuda.synchronize()
-    dist.barrier(group)
+    _sync()
+    if fail_rank == -1:
+        dist.barrier(group)
 
 
 def worker(rank, world_size, config_dict):
-    # Device filter
+    _set_device(rank)
+    torch.set_default_dtype(torch.bfloat16)
+
+    # Device filter: constrain to a single HCA to avoid cross-NIC
+    # address-resolution failures on multi-NIC hosts (e.g. MT S5000).
     device_filter = [
         f
-        for f in os.getenv("DEVICE_FILTER", "mlx5_1,mlx5_2,mlx5_3,mlx5_4").split(",")
+        for f in os.getenv("DEVICE_FILTER", "mlx5_2").split(",")
         if f
     ]
     if device_filter:
         pg.set_device_filter(device_filter)
 
-    torch.cuda.set_device(rank)
-    torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("cuda")
+    backend = "mooncake"
 
-    dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     group = dist.group.WORLD
 
     try:
@@ -211,23 +237,51 @@ def worker(rank, world_size, config_dict):
         traceback.print_exc()
         raise
 
-    dist.destroy_process_group()
+    if config_dict.get("fail_rank", -1) != -1:
+        # Survivor: skip destroy_process_group (would hang) and exit hard.
+        # PG backend background threads (ConnectionPoller, WorkerThread)
+        # won't stop without destroy_process_group, so os._exit(0) is the
+        # only way to ensure the process terminates before the next test.
+        os._exit(0)
+
+    if config_dict.get("fail_rank", -1) == -1:
+        try:
+            dist.destroy_process_group()
+        except RuntimeError as e:
+            if not _USE_MUSA or "No backend type associated with device type musa" not in str(e):
+                raise
 
 
 class TestMooncakeEPBuffer(unittest.TestCase):
+    _port_counter = 29500
+
     def setUp(self):
-        self.world_size = torch.cuda.device_count()
+        self.world_size = _device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
+        os.environ["MASTER_PORT"] = str(TestMooncakeEPBuffer._port_counter)
+        TestMooncakeEPBuffer._port_counter += 1
+        # Constrain EP to a single HCA to avoid cross-NIC address-resolution
+        # failures on multi-NIC hosts (e.g. MT S5000).
+        if "MOONCAKE_EP_DEVICE_FILTER" not in os.environ:
+            os.environ["MOONCAKE_EP_DEVICE_FILTER"] = os.getenv(
+                "DEVICE_FILTER", "mlx5_2"
+            )
 
     def run_single_config(self, config_dict):
-        mp.spawn(
-            worker,
-            args=(self.world_size, config_dict),
-            nprocs=self.world_size,
-            join=True,
-            daemon=False,
-        )
+        try:
+            mp.spawn(
+                worker,
+                args=(self.world_size, config_dict),
+                nprocs=self.world_size,
+                join=True,
+                daemon=False,
+            )
+        except mp.ProcessExitedException:
+            if config_dict.get("fail_rank", -1) == -1:
+                raise
+            # Safety net: let all survivor processes fully terminate.
+            import time
+            time.sleep(5)
 
 
 def make_test_name(cfg):
@@ -284,6 +338,24 @@ def generate_tests():
         raw_dict = dict(zip(keys, t))
 
         if raw_dict["async_finish"] and raw_dict["return_recv_hook"]:
+            continue
+
+        # Mooncake PG backend has built-in fault tolerance (peer liveness
+        # probe, automatic failed-rank exclusion).  No need to skip fail_rank
+        # tests on MUSA.
+
+        # Fallback path uses dist.all_gather (collective), incompatible with
+        # fail_rank (rank 1 has os._exit(0) and cannot participate).
+        if raw_dict["use_fallback"] and raw_dict["fail_rank"] != -1:
+            continue
+
+        # MUSA does not support FP8 in the kernel
+        if _USE_MUSA and raw_dict["use_fp8"]:
+            continue
+
+        # MUSA: cooperative launch not supported, so return_recv_hook is forced
+        # True; async_finish + return_recv_hook is invalid, skip async_finish
+        if _USE_MUSA and raw_dict["async_finish"]:
             continue
 
         # Flatten
