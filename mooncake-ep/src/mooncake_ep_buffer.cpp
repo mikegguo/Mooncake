@@ -29,7 +29,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
-      comm_stream(EP_GET_STREAM_FROM_POOL(true))
+      comm_stream(at::cuda::getStreamFromPool(true))
 {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
@@ -155,7 +155,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
-    auto compute_stream = EP_GET_CURRENT_STREAM();
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
@@ -290,7 +290,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
-    auto compute_stream = EP_GET_CURRENT_STREAM();
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
@@ -375,7 +375,7 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
          num_msg_elems, 1},
         torch::TensorOptions()
             .dtype(torch::kBFloat16)
-            .device(torch::Device(kDeviceType, device_id)));
+            .device(torch::Device(torch::kCUDA, device_id)));
 }
 
 void MooncakeEpBuffer::update_local_qpns() {

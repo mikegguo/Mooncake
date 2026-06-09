@@ -97,11 +97,6 @@ def run_test_iteration(
     )
     buf = Buffer(group, num_ep_buffer_bytes)
 
-    # Avoid changing torch_musa's process-wide default device; all tensors in
-    # this test already pass device explicitly.
-    if not _USE_MUSA:
-        torch.set_default_device(_DEVICE)
-
     if use_fallback:
         buf._use_fallback = True
 
@@ -111,11 +106,6 @@ def run_test_iteration(
     dist.barrier(group)
 
     if rank == fail_rank:
-        import time
-        # Don't exit immediately — mp.spawn would SIGTERM survivors before
-        # they finish dispatch+combine.  Sleep long enough for survivors
-        # (dispatch 5s timeout + combine 5s timeout + overhead).
-        time.sleep(30)
         os._exit(0)
 
     # Dispatch
@@ -131,7 +121,7 @@ def run_test_iteration(
         return_recv_hook=return_recv_hook,
     )
 
-    if return_recv_hook or hook is not None:
+    if return_recv_hook:
         hook()
     if async_finish:
         event.current_stream_wait()
@@ -187,7 +177,7 @@ def run_test_iteration(
         out=out_tensor,
     )
 
-    if return_recv_hook or hook is not None:
+    if return_recv_hook:
         hook()
     if async_finish:
         event.current_stream_wait()
@@ -203,8 +193,6 @@ def run_test_iteration(
     )
 
     _sync()
-    if fail_rank == -1:
-        dist.barrier(group)
 
 
 def worker(rank, world_size, config_dict):
